@@ -5,28 +5,39 @@ Site:  MOODLE_SITE=<key>  (see SITES below or run with --sites), or MOODLE_URL=<
 
 Token lookup order:
     1. MOODLE_TOKEN environment variable
-    2. .token file next to this script   (one line, chmod 600)
+    2. MOODLE_TOKEN_FILE, default .token next to this script   (one line, chmod 600)
+
+Other settings: MOODLE_DOWNLOAD_DIR, MOODLE_MAX_DOWNLOAD_MB (200), MOODLE_DOWNLOAD_SECONDS,
+MOODLE_SKIP_PREFLIGHT=1, MOODLE_DOWNLOAD_TOKEN_IN_QUERY=1 (see _fetch).
+All settings are read when used: importing this module never exits, prints or touches the network.
 
 Get a token:  .venv/bin/python moodle_mcp.py --login   (see moodle_login.py)
 Run:          .venv/bin/python moodle_mcp.py           (stdio)
 """
 
+import itertools
+import json
 import logging
 import os
 import re
+import sys
 import time
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-# httpx logs every request URL at INFO, and download_file puts the token in the URL.
+# Pure URL / file name checks (no network, no env); also reachable as moodle_mcp.<name>.
+from moodle_safety import check_download_url, safe_filename, safe_subfolder, validate_base_url
+
+# httpx/httpcore log every request URL at INFO (the fallback download puts the token in the URL).
 # Keep it out of the MCP server log.
-logging.getLogger("httpx").setLevel(logging.WARNING)
+for _name in ("httpx", "httpcore"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 # Israeli institutions whose Moodle answered the public config endpoint (checked 2026-11).
 # Pick one with MOODLE_SITE=<key>; anything else works through MOODLE_URL.
@@ -74,37 +85,219 @@ SITES = {
     "arabcol": ("Arab Academic College for Education, Haifa", "https://moodle4.arabcol.ac.il"),
 }
 
-_site = os.environ.get("MOODLE_SITE", "tau").strip().lower()
-if _site not in SITES and not os.environ.get("MOODLE_URL"):
-    raise SystemExit(f"Unknown MOODLE_SITE '{_site}'. Options: {', '.join(SITES)} (or set MOODLE_URL)")
-BASE = (os.environ.get("MOODLE_URL") or SITES[_site][1]).rstrip("/")
-TOKEN_FILE = Path(os.environ.get("MOODLE_TOKEN_FILE", Path(__file__).resolve().parent / ".token"))
-DOWNLOAD_DIR = Path(os.environ.get("MOODLE_DOWNLOAD_DIR", Path.home() / "Downloads" / "moodle")).resolve()
+DOWNLOAD_DEADLINE_S = 120  # one file download, start to end
+PREFLIGHT_MAX_BYTES = 64 * 1024  # the identity preflight talks to a not yet verified host
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]{16,128}")  # Moodle tokens are PARAM_ALPHANUM
+_TOKEN_PARAM_RE = re.compile(r"(\w*token=)[^&\s'\"<>]*", re.IGNORECASE)
+_RESERVED_PARAMS = frozenset({"wstoken", "wsfunction", "moodlewsrestformat"})
+_FRIENDLY = {
+    "invalidtoken": "Moodle rejected the token (invalidtoken). Create a new token and save it.",
+    "accessexception": "Moodle denied access (accessexception): the token may be expired or restricted, "
+                       "or the mobile web service is disabled.",
+}
+
+
+class ConfigError(RuntimeError):
+    """Bad MOODLE_* setting or token. Raised when the setting is used, never at import."""
+
+
+class MoodleError(RuntimeError):
+    """Moodle, HTTP or network failure. The message is short, scrubbed and never contains a URL."""
+
+    def __init__(self, message: str, errorcode: str | None = None):
+        super().__init__(message)
+        self.errorcode = errorcode
+
+
+def get_base() -> str:
+    """The Moodle base URL (MOODLE_URL, else the MOODLE_SITE preset), read from the env on every call."""
+    custom = os.environ.get("MOODLE_URL", "").strip()
+    site = os.environ.get("MOODLE_SITE", "").strip().lower() or "tau"
+    if not custom and site not in SITES:
+        raise ConfigError(f"Unknown MOODLE_SITE {site[:40]!r}. Options: {', '.join(SITES)} (or set MOODLE_URL)")
+    try:
+        return validate_base_url(custom or SITES[site][1])
+    except ValueError as e:
+        raise ConfigError(f"Invalid MOODLE_URL: {e}") from None
+
+
+def token_file() -> Path:
+    raw = os.environ.get("MOODLE_TOKEN_FILE", "").strip()
+    return Path(raw).expanduser() if raw else Path(__file__).resolve().parent / ".token"
+
+
+def download_dir() -> Path:
+    raw = os.environ.get("MOODLE_DOWNLOAD_DIR", "").strip()
+    return Path(raw or Path.home() / "Downloads" / "moodle").expanduser().resolve()
+
+
+def download_seconds() -> float:
+    """Time budget of one download_course call (MOODLE_DOWNLOAD_SECONDS, default 45)."""
+    try:
+        sec = float(os.environ.get("MOODLE_DOWNLOAD_SECONDS", "").strip() or "45")
+    except ValueError:
+        raise ConfigError("MOODLE_DOWNLOAD_SECONDS must be a number") from None
+    if not 0 <= sec <= 3600:
+        raise ConfigError("MOODLE_DOWNLOAD_SECONDS must be between 0 and 3600")
+    return sec
+
+
+def max_download_bytes() -> int:
+    raw = os.environ.get("MOODLE_MAX_DOWNLOAD_MB", "").strip() or "200"
+    try:
+        mb = float(raw)
+    except ValueError:
+        raise ConfigError("MOODLE_MAX_DOWNLOAD_MB must be a number") from None
+    if not 0 < mb <= 100_000:
+        raise ConfigError("MOODLE_MAX_DOWNLOAD_MB must be between 0 and 100000")
+    return int(mb * 1024 * 1024)
+
 
 mcp = FastMCP("moodle")
-_client = httpx.Client(timeout=30)
+_client = httpx.Client(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=False)
 _userid: int | None = None
+_preflight_ok: set[str] = set()  # bases whose identity preflight passed
+_skip_warned: set[str] = set()  # MOODLE_SKIP_PREFLIGHT warning printed (once per process)
+_perm_warned: set[str] = set()  # token files already warned about
 
 
 def token() -> str:
-    """Read the token lazily so the server still starts (and explains itself) without one."""
+    """Read the token lazily so the server still starts (and explains itself) without one.
+    The token never appears in an error message."""
     tok = os.environ.get("MOODLE_TOKEN", "").strip()
-    if not tok and TOKEN_FILE.exists():
-        tok = TOKEN_FILE.read_text().strip()
+    path = token_file()
     if not tok:
-        raise RuntimeError(f"No Moodle token. Set MOODLE_TOKEN or put the token in {TOKEN_FILE}")
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            raw = b""
+        except OSError as e:
+            raise ConfigError(f"Cannot read the token file {path} ({type(e).__name__})") from None
+        try:  # PowerShell 5.1 `>` writes UTF-16; Notepad may add a UTF-8 BOM
+            tok = raw.decode("utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig").strip()
+        except UnicodeDecodeError:
+            raise ConfigError(f"The token file {path} is not valid text") from None
+        if tok and os.name == "posix" and str(path) not in _perm_warned:
+            try:
+                too_open = bool(path.stat().st_mode & 0o077)
+            except OSError:
+                too_open = False
+            if too_open:
+                _perm_warned.add(str(path))
+                print(f"moodle-mcp: WARNING {path} is readable by other users; run chmod 600 on it",
+                      file=sys.stderr)
+    if not tok:
+        raise ConfigError(f"No Moodle token. Set MOODLE_TOKEN or put the token in {path}")
+    if not _TOKEN_RE.fullmatch(tok):
+        raise ConfigError("The Moodle token has an invalid format (expected 16-128 letters/digits)")
     return tok
 
 
+def scrub(text) -> str:
+    """Replace the token, and the value of any token=/wstoken= parameter, with ***."""
+    text = str(text)
+    try:
+        tok = token()
+    except ConfigError:
+        tok = None
+    if tok:
+        text = text.replace(tok, "***")
+    return _TOKEN_PARAM_RE.sub(r"\1***", text)
+
+
+def _send(method: str, url: str, max_bytes: int | None = None, **kwargs) -> bytes:
+    """One request through _client. Errors are MoodleError without the URL (httpx puts it in its
+    messages, and the URL may carry the token)."""
+    try:
+        with _client.stream(method, url, follow_redirects=False, **kwargs) as r:
+            if r.status_code != 200:
+                raise MoodleError(f"Moodle answered HTTP {r.status_code}.")
+            body = bytearray()
+            for chunk in r.iter_bytes():
+                body += chunk
+                if max_bytes is not None and len(body) > max_bytes:
+                    raise MoodleError("Moodle's reply was too large.")
+            return bytes(body)
+    except httpx.TimeoutException:
+        raise MoodleError("Moodle did not answer in time (timeout).") from None
+    except httpx.HTTPError as e:
+        raise MoodleError(f"Could not reach Moodle ({type(e).__name__}).") from None
+
+
+def _json(body: bytes):
+    try:
+        return json.loads(body)
+    except (ValueError, RecursionError):
+        raise MoodleError("Moodle returned an invalid (non-JSON) response.") from None
+
+
+def _moodle_error(out) -> MoodleError | None:
+    """The error in a Moodle reply ({"exception"/"errorcode", "message"}), scrubbed then truncated."""
+    if not (isinstance(out, dict) and (out.get("exception") or "errorcode" in out)):
+        return None
+    code = out.get("errorcode") if isinstance(out.get("errorcode"), str) else None
+    if code in _FRIENDLY:
+        return MoodleError(_FRIENDLY[code], code)
+    return MoodleError(scrub(f"{code}: {out.get('message') or out.get('error')}")[:300], code)
+
+
+def _public_config(base: str) -> dict:
+    """tool_mobile_get_public_config via the token-less nologin endpoint; returns its `data`."""
+    body = [{"index": 0, "methodname": "tool_mobile_get_public_config", "args": {}}]
+    url = f"{base}/lib/ajax/service-nologin.php?info=tool_mobile_get_public_config"
+    out = _json(_send("POST", url, PREFLIGHT_MAX_BYTES, json=body))
+    item = out[0] if isinstance(out, list) and out and isinstance(out[0], dict) else {}
+    data = item.get("data") if not item.get("error", True) else None
+    if not isinstance(data, dict):
+        raise MoodleError("the site did not answer like a Moodle site.")
+    return data
+
+
+def _host_of(url) -> str | None:
+    try:
+        return urlsplit(url.strip()).hostname if isinstance(url, str) else None
+    except ValueError:
+        return None
+
+
+def ensure_site_identity() -> None:
+    """Before the token is first sent to a base: a token-less check that the host really is that
+    Moodle (its public config names the same host). Cached per base."""
+    base = get_base()
+    if os.environ.get("MOODLE_SKIP_PREFLIGHT", "").strip() == "1":
+        if not _skip_warned:
+            _skip_warned.add(base)
+            print("moodle-mcp: WARNING site identity preflight disabled (MOODLE_SKIP_PREFLIGHT=1)",
+                  file=sys.stderr)
+        return
+    if base in _preflight_ok:
+        return
+    refuse = "Refusing to send your token: "
+    try:
+        data = _public_config(base)
+    except MoodleError as e:
+        raise MoodleError(refuse + f"could not verify the site ({e})") from None
+    host = urlsplit(base).hostname
+    if not any(_host_of(data.get(k)) == host for k in ("wwwroot", "httpswwwroot")):
+        raise MoodleError(refuse + f"the site does not identify itself as {host}.")
+    _preflight_ok.add(base)
+
+
 def call(function: str, **params):
-    """Call a Moodle web service function (REST, JSON)."""
-    data = {"wstoken": token(), "wsfunction": function, "moodlewsrestformat": "json"}
-    data.update(_flatten(params))
-    r = _client.post(f"{BASE}/webservice/rest/server.php", data=data)
-    r.raise_for_status()
-    out = r.json()
-    if isinstance(out, dict) and out.get("exception"):
-        raise RuntimeError(f"{out.get('errorcode')}: {out.get('message')}")
+    """Call a Moodle web service function (REST, JSON). The token goes in the POST body only."""
+    flat = _flatten(params)
+    if _RESERVED_PARAMS & (set(params) | set(flat)):
+        raise ValueError("wstoken, wsfunction and moodlewsrestformat cannot be passed as params")
+    base = get_base()
+    if function == "tool_mobile_get_public_config":
+        return _public_config(base)  # public: never send the token for it
+    tok = token()
+    ensure_site_identity()
+    data = {**flat, "wstoken": tok, "wsfunction": function, "moodlewsrestformat": "json"}
+    out = _json(_send("POST", f"{base}/webservice/rest/server.php", data=data))
+    err = _moodle_error(out)
+    if err:
+        raise err
     return out
 
 
@@ -179,13 +372,8 @@ def text(html, limit: int | None = None) -> str:
 
 
 def _safe(name, limit: int = 80) -> str:
-    """A file or folder name that is safe on macOS, Windows and Linux."""
-    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", str(name or ""))
-    name = re.sub(r"\s+", " ", name).strip(" .")
-    if len(name) > limit:
-        stem, dot, ext = name.rpartition(".")
-        name = stem[:limit - len(ext) - 1].rstrip(" .") + "." + ext if dot and len(ext) <= 8 else name[:limit].rstrip(" .")
-    return name or "untitled"
+    """A file or folder name that is safe on macOS, Windows and Linux (see moodle_safety.safe_filename)."""
+    return safe_filename(name, limit)
 
 
 def _my_courses(include_past: bool = False) -> list[dict]:
@@ -213,31 +401,73 @@ def _plugin_files(plugins) -> list[dict]:
             for p in plugins or [] for area in p.get("fileareas", []) for f in area.get("files", [])]
 
 
-def _fetch(fileurl: str, path: Path) -> int:
-    """Stream a Moodle file to path. Returns the size in bytes."""
-    url, base = urlsplit(fileurl), urlsplit(BASE)
-    # Exact scheme+host match: the token is appended to this URL, so it must never leave Moodle.
-    if (url.scheme, url.netloc) != (base.scheme, base.netloc):
-        raise ValueError("Only Moodle file URLs are allowed")
-    sep = "&" if url.query else "?"
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _fetch(fileurl: str, path: Path, max_bytes: int | None = None) -> int:
+    """Stream a Moodle file to path (replacing an older copy). Returns the size in bytes."""
+    # Only <base>/webservice/pluginfile.php/... on exactly the Moodle host: the token goes with it.
+    check_download_url(fileurl, get_base())
+    cap = min(max_bytes, max_download_bytes()) if max_bytes else max_download_bytes()  # the user's limit wins
+    root = download_dir()
     tmp = path.with_name(path.name + ".part")
+    tok = token()
+    ensure_site_identity()
+
+    def inside() -> bool:  # resolve() follows symlinks, so a symlinked subfolder can't lead out
+        return path.resolve().is_relative_to(root) and tmp.resolve().is_relative_to(root)
+    if not inside():
+        raise ValueError("Refusing to write outside the download directory")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not inside():  # again, now that the folders exist
+        raise ValueError("Refusing to write outside the download directory")
+    if os.environ.get("MOODLE_DOWNLOAD_TOKEN_IN_QUERY", "").strip() == "1":
+        # Fallback for Moodle sites that ignore a POST body token: the old ?token= way (the URL
+        # with the token can end up in server/proxy logs, so it is opt-in).
+        sep = "&" if urlsplit(fileurl).query else "?"
+        req = _client.stream("GET", fileurl + sep + urlencode({"token": tok}), follow_redirects=False)
+    else:  # pluginfile.php reads `token` from GET or POST; the body keeps it out of URLs and logs
+        req = _client.stream("POST", fileurl, data={"token": tok}, follow_redirects=False)
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE_S
+    too_big = MoodleError(f"File is larger than the {cap / 1048576:g} MB download limit")
     size = 0
     try:
-        with _client.stream("GET", f"{fileurl}{sep}token={token()}", follow_redirects=False) as r:
+        with req as r:
             if r.status_code != 200:
-                raise RuntimeError(f"Moodle answered HTTP {r.status_code} for this file")
+                raise MoodleError(f"Moodle answered HTTP {r.status_code} for this file")
+            chunks, first = r.iter_bytes(), []
             if "application/json" in r.headers.get("content-type", ""):
-                r.read()
-                raise RuntimeError(f"Moodle refused the download: {r.text[:300]}")
+                # A Moodle error is a small JSON reply; a course file that really is a .json
+                # document is a normal download (what was read here is written first).
+                head = b""
+                for chunk in chunks:
+                    first.append(chunk)
+                    head += chunk
+                    if len(head) > 65536 or time.monotonic() > deadline:
+                        break
+                try:
+                    out = json.loads(head)
+                except (ValueError, RecursionError):
+                    out = None
+                err = _moodle_error(out)
+                if err is None and isinstance(out, dict) and isinstance(out.get("error"), str):
+                    err = MoodleError(scrub(f"Moodle refused the download: {out['error']}")[:200])
+                if err:
+                    raise err
+            declared = r.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > cap:
+                raise too_big
             with open(tmp, "wb") as fh:
-                for chunk in r.iter_bytes():
-                    fh.write(chunk)
+                for chunk in itertools.chain(first, chunks):
                     size += len(chunk)
+                    if size > cap:
+                        raise too_big
+                    if time.monotonic() > deadline:
+                        raise MoodleError(f"Download took over {DOWNLOAD_DEADLINE_S} s")
+                    fh.write(chunk)
         tmp.replace(path)
+    except httpx.TimeoutException:
+        raise MoodleError("Download timed out") from None
     except httpx.HTTPError as e:
-        # httpx puts the request URL (with the token) in its messages; never pass them on.
-        raise RuntimeError(f"Download failed: {type(e).__name__}") from None
+        # httpx puts the request URL (maybe with the token) in its messages; never pass them on.
+        raise MoodleError(f"Download failed: {type(e).__name__}") from None
     finally:
         tmp.unlink(missing_ok=True)
     return size
@@ -514,13 +744,14 @@ def whats_new(days: int = 7) -> dict:
 @mcp.tool()
 def download_file(fileurl: str, subfolder: str = "") -> str:
     """Download a course file (fileurl from course_contents / assignments) to the local downloads folder."""
-    target = (DOWNLOAD_DIR / subfolder).resolve()
-    if not target.is_relative_to(DOWNLOAD_DIR):
+    root = download_dir()
+    target = (root / safe_subfolder(subfolder)).resolve()
+    if not target.is_relative_to(root):
         raise ValueError("subfolder must stay inside the download directory")
-    name = Path(unquote(urlsplit(fileurl).path)).name
-    if not name:
+    name = unquote(urlsplit(fileurl).path.rsplit("/", 1)[-1])
+    if not name.strip(" ."):
         raise ValueError("URL has no file name")
-    path = target / name
+    path = target / safe_filename(name)
     _fetch(fileurl, path)
     return str(path)
 
@@ -532,8 +763,8 @@ def download_course(course_id: int, section: str = "", max_mb: int = 200) -> dic
     are skipped, so calling it again only fetches what is new. If `remaining` is above 0 it ran
     out of time: call it again to continue."""
     course = next((c for c in _my_courses(include_past=True) if c["id"] == course_id), None)
-    root = DOWNLOAD_DIR / _safe(course["fullname"] if course else f"course {course_id}")
-    budget = time.time() + float(os.environ.get("MOODLE_DOWNLOAD_SECONDS", "45"))
+    root = download_dir() / _safe(course["fullname"] if course else f"course {course_id}")
+    budget = time.time() + download_seconds()
     out = {"folder": str(root), "downloaded": [], "unchanged": 0, "remaining": 0,
            "too_large": [], "failed": [], "bytes": 0}
     seen = set()
@@ -555,7 +786,7 @@ def download_course(course_id: int, section: str = "", max_mb: int = 200) -> dic
                 if path in seen:  # two activities in a section with the same file name
                     path = path.with_stem(f"{path.stem} ({mod['id']})")
                 seen.add(path)
-                if not path.resolve().is_relative_to(DOWNLOAD_DIR):
+                if not path.resolve().is_relative_to(download_dir()):
                     continue
                 size, modified = f.get("filesize") or 0, f.get("timemodified") or 0
                 if path.exists() and path.stat().st_size == size and path.stat().st_mtime >= modified:
@@ -566,21 +797,32 @@ def download_course(course_id: int, section: str = "", max_mb: int = 200) -> dic
                     out["remaining"] += 1
                 else:
                     try:
-                        out["bytes"] += _fetch(f["fileurl"], path)
+                        out["bytes"] += _fetch(f["fileurl"], path, max_mb * 1024 * 1024)
                         out["downloaded"].append(str(path.relative_to(root)))
                     except Exception as e:
                         out["failed"].append({"filename": f["filename"], "error": str(e)[:150]})
     return out
 
 
-if __name__ == "__main__":
-    import sys
-    if "--sites" in sys.argv:
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else list(argv)
+    if "--sites" in args:
         for key, (name, url) in SITES.items():
             print(f"{key:11} {name:45} {url}")
-    elif "--login" in sys.argv:
+        return 0
+    try:
+        base = get_base()
+    except ConfigError as e:
+        print(f"moodle-mcp: {e}", file=sys.stderr)
+        return 2
+    if "--login" in args:
         from moodle_login import login
-        forced = next((m for m in ("browser", "password") if f"--{m}" in sys.argv), None)
-        login(BASE, TOKEN_FILE, forced)
+        forced = next((m for m in ("browser", "password") if f"--{m}" in args), None)
+        login(base, token_file(), forced)
     else:
         mcp.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
