@@ -1,0 +1,18 @@
+# Tooling config only (pytest + ruff). This project is a script, not a package.
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "live: talks to a real Moodle site; skipped unless MOODLE_LIVE=1",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [".venv", "demo"]
+
+[tool.ruff.lint]
+# ruff's default rules (pyflakes + the pycodestyle errors that are bugs, not style)
+select = ["E4", "E7", "E9", "F"]

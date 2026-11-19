@@ -216,13 +216,23 @@ mkdir -p ~/.claude/skills && cp -r skills/moodle ~/.claude/skills/
 | `MOODLE_TOKEN` | – | ה-token (גובר על הקובץ `.token`) |
 | `MOODLE_TOKEN_FILE` | `.token` ליד הסקריפט | מאיפה לקרוא את ה-token |
 | `MOODLE_DOWNLOAD_DIR` | `~/Downloads/moodle` | לאן נשמרות ההורדות |
+| `MOODLE_MAX_DOWNLOAD_MB` | `200` | גודל מקסימלי לקובץ מורד (קובץ גדול יותר נעצר ונמחק) |
+| `MOODLE_SKIP_PREFLIGHT` | – | `1` מדלג על בדיקת הזהות של האתר (לא מומלץ; ראו אבטחה) |
+| `MOODLE_DOWNLOAD_TOKEN_IN_QUERY` | – | `1` שולח את ה-token בכתובת ההורדה במקום בגוף הבקשה. רק למוסד שמסרב לגוף הבקשה |
 
 ## 🔒 אבטחה
 
 - ה-token שווה ערך לסיסמה לקריאת ה-Moodle שלכם. לא מעלים אותו ל-git ולא מדביקים אותו בצ'אט.
 - ב-`--login` הסיסמה עוברת רק ל-Moodle של המוסד ולא נשמרת. המפתח שחוזר נבדק לפני שהוא נשמר.
-- ה-token נשלח רק לשרת ה-Moodle שהוגדר. הורדה מכל כתובת אחרת נחסמת.
-- הורדות לא יכולות לצאת מתיקיית ההורדות.
+- ה-token נשלח רק לשרת ה-Moodle שהוגדר, ורק בגוף הבקשה (POST), לא בכתובת. כך הוא לא נכנס ללוגים ולא להודעות שגיאה. הורדה מכל כתובת אחרת, או מכתובת שאינה `webservice/pluginfile.php`, נחסמת.
+- לפני שה-token נשלח בפעם הראשונה השרת שואל את Moodle (בלי token) מי הוא, ומסרב אם האתר לא מזדהה כמוסד שהוגדרת. זה תופס שגיאות הקלדה וכתובות שהוחלפו.
+- השרת קורא רק לרשימה סגורה של פונקציות קריאה של Moodle (`READ_FUNCTIONS` בקוד), והבדיקה נעשית לפני כל בקשה. כלי חדש חייב להוסיף את הפונקציה שלו לרשימה, ולכן זה גלוי ב-diff. שימו לב: זה מגביל את **השרת**, לא את ה-token: ל-token עצמו יש ב-Moodle הרשאות רחבות יותר (כמו הגשת מטלות ופרסום בפורום).
+- כל טקסט שנכתב על ידי אחרים ב-Moodle (שמות קורסים וקבצים, הודעות בפורומים, תיאורי מטלות, התראות) מוחזר עטוף ב-`<untrusted_moodle_content source="...">`, ומוסרים ממנו טקסט נסתר (HTML מוסתר, תווים בלתי נראים). השרת מורה למודל להתייחס אליו כמידע ולא כהוראות, כדי להקשות על prompt injection (למשל פוסט שמנסה להפעיל כלים). זה מקשה אבל לא מבטל את הסיכון; הרשימה הסגורה למעלה מגבילה את הנזק גם אם המודל בכל זאת יתפתה.
+- הכלים בודקים את הפרמטרים לפני כל בקשה (מספרים חיוביים, טווחי ימים, אורך טקסט), ותשובה לא צפויה מ-Moodle נותנת ערך ריק במקום קריסה.
+- `python moodle_mcp.py --doctor` בודק את ההתקנה (כתובת, token, זהות האתר) ומציג אילו פונקציות כתיבה ה-token שלכם מחזיק. הוא לא מדפיס את ה-token ולא נתונים אישיים.
+- `MOODLE_URL` חייב להתחיל ב-`https://` (`http://` רק ל-localhost), בלי שם משתמש/סיסמה בכתובת.
+- הורדות לא יכולות לצאת מתיקיית ההורדות: שמות קבצים ותיקיות מנוקים (גם שמות שמורים של Windows כמו `CON`), יש הגבלת גודל וזמן, ואין מעקב אחרי הפניות.
+- הטסטים רצים בלי רשת ובלי token אמיתי: `pip install -r requirements-dev.txt` ואז `python -m pytest`.
 
 </div>
 
@@ -281,6 +291,29 @@ Run `.venv/bin/python moodle_mcp.py --sites` for the full list of institutions w
 **Other apps:** MCP is an open standard, so any app that runs local MCP servers works, whatever model it uses. Add the same JSON block to Cursor (`~/.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Gemini CLI (`~/.gemini/settings.json`) or LM Studio (Program → Install → Edit mcp.json). VS Code uses `.vscode/mcp.json` with a top-level `servers` key and `"type": "stdio"`; Codex CLI uses the TOML block above in `~/.codex/config.toml`. Only Claude Code has been tested. It does not work in ChatGPT, Gemini on the web, claude.ai or phone apps, which only connect to servers hosted on the internet.
 
 All 37 sites were checked to be live Moodle sites (November 2026), but only TAU has been tested end to end with a real token.
+
+### Security and settings
+
+- Your token is as sensitive as a password for reading your Moodle. Don't commit it or paste it into a chat.
+- The token is sent only to the configured Moodle host, and only in the POST body, never in a URL, so it can't end up in logs or error messages. Downloads from any other host, or from anything but `webservice/pluginfile.php`, are refused.
+- Before the token is first sent, the server asks the site (without the token) who it is, and refuses if it doesn't identify itself as the host you configured. That catches typos and hosts that changed hands.
+- The server only calls a closed list of read-only Moodle functions (`READ_FUNCTIONS` in the code), checked before every request. A new tool has to add its function to that list, so it shows up in the diff. Note that this limits the **server**, not your token: the token itself can do more in Moodle (submit assignments, post in forums).
+- Text written by other people in Moodle (course and file names, forum posts, assignment descriptions, notifications) is returned wrapped in `<untrusted_moodle_content source="...">`, with hidden content (hidden HTML, invisible characters) removed. The server tells the assistant to treat it as data, not instructions, which makes prompt injection harder (for example a post that tries to make the assistant call tools). That reduces the risk but does not remove it; the closed list above limits the damage even if the assistant is tempted.
+- Tools validate their arguments before any request (positive ids, day ranges, text length), and an unexpected reply from Moodle yields an empty value instead of a crash.
+- `python moodle_mcp.py --doctor` checks your setup (URL, token, site identity) and lists the write functions your token holds. It prints no token and no personal data.
+- `MOODLE_URL` must be `https://` (`http://` only for localhost) and contain no user name or password.
+- Downloads can't leave the download folder: file and folder names are sanitized (including Windows device names like `CON`), there is a size and time limit, and redirects are never followed.
+- Tests run offline with no real token: `pip install -r requirements-dev.txt && python -m pytest`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MOODLE_SITE` | `tau` | institution key (`--sites`) |
+| `MOODLE_URL` | – | any other Moodle (overrides `MOODLE_SITE`) |
+| `MOODLE_TOKEN` / `MOODLE_TOKEN_FILE` | `.token` next to the script | where the token comes from |
+| `MOODLE_DOWNLOAD_DIR` | `~/Downloads/moodle` | where downloads go |
+| `MOODLE_MAX_DOWNLOAD_MB` | `200` | largest file a download may be |
+| `MOODLE_SKIP_PREFLIGHT` | – | `1` skips the site identity check (not recommended) |
+| `MOODLE_DOWNLOAD_TOKEN_IN_QUERY` | – | `1` puts the token in the download URL instead of the request body; only for a Moodle that rejects the body |
 
 ---
 
